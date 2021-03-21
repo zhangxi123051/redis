@@ -42,7 +42,7 @@
 #include <time.h>
 
 #include "util.h"
-#include "sha1.h"
+#include "sha256.h"
 
 /* Glob-style pattern matching. */
 int stringmatchlen(const char *pattern, int patternLen,
@@ -51,7 +51,7 @@ int stringmatchlen(const char *pattern, int patternLen,
     while(patternLen && stringLen) {
         switch(pattern[0]) {
         case '*':
-            while (pattern[1] == '*') {
+            while (patternLen && pattern[1] == '*') {
                 pattern++;
                 patternLen--;
             }
@@ -67,8 +67,6 @@ int stringmatchlen(const char *pattern, int patternLen,
             return 0; /* no match */
             break;
         case '?':
-            if (stringLen == 0)
-                return 0; /* no match */
             string++;
             stringLen--;
             break;
@@ -96,7 +94,7 @@ int stringmatchlen(const char *pattern, int patternLen,
                     pattern--;
                     patternLen++;
                     break;
-                } else if (pattern[1] == '-' && patternLen >= 3) {
+                } else if (patternLen >= 3 && pattern[1] == '-') {
                     int start = pattern[0];
                     int end = pattern[2];
                     int c = string[0];
@@ -244,6 +242,33 @@ long long memtoll(const char *p, int *err) {
         return 0;
     }
     return val*mul;
+}
+
+/* Search a memory buffer for any set of bytes, like strpbrk().
+ * Returns pointer to first found char or NULL.
+ */
+const char *mempbrk(const char *s, size_t len, const char *chars, size_t charslen) {
+    for (size_t j = 0; j < len; j++) {
+        for (size_t n = 0; n < charslen; n++)
+            if (s[j] == chars[n]) return &s[j];
+    }
+
+    return NULL;
+}
+
+/* Modify the buffer replacing all occurrences of chars from the 'from'
+ * set with the corresponding char in the 'to' set. Always returns s.
+ */
+char *memmapchars(char *s, size_t len, const char *from, const char *to, size_t setlen) {
+    for (size_t j = 0; j < len; j++) {
+        for (size_t i = 0; i < setlen; i++) {
+            if (s[j] == from[i]) {
+                s[j] = to[i];
+                break;
+            }
+        }
+    }
+    return s;
 }
 
 /* Return the number of digits of 'v' when converted to string in radix 10.
@@ -602,6 +627,10 @@ int ld2string(char *buf, size_t len, long double value, ld2string_mode mode) {
                 }
                 if (*p == '.') l--;
             }
+            if (l == 2 && buf[0] == '-' && buf[1] == '0') {
+                buf[0] = '0';
+                l = 1;
+            }
             break;
         default: return 0; /* Invalid mode. */
         }
@@ -618,7 +647,7 @@ int ld2string(char *buf, size_t len, long double value, ld2string_mode mode) {
 void getRandomBytes(unsigned char *p, size_t len) {
     /* Global state. */
     static int seed_initialized = 0;
-    static unsigned char seed[20]; /* The SHA1 seed, from /dev/urandom. */
+    static unsigned char seed[64]; /* 512 bit internal block size. */
     static uint64_t counter = 0; /* The counter we hash with the seed. */
 
     if (!seed_initialized) {
@@ -643,14 +672,34 @@ void getRandomBytes(unsigned char *p, size_t len) {
     }
 
     while(len) {
-        unsigned char digest[20];
-        SHA1_CTX ctx;
-        unsigned int copylen = len > 20 ? 20 : len;
+        /* This implements SHA256-HMAC. */
+        unsigned char digest[SHA256_BLOCK_SIZE];
+        unsigned char kxor[64];
+        unsigned int copylen =
+            len > SHA256_BLOCK_SIZE ? SHA256_BLOCK_SIZE : len;
 
-        SHA1Init(&ctx);
-        SHA1Update(&ctx, seed, sizeof(seed));
-        SHA1Update(&ctx, (unsigned char*)&counter,sizeof(counter));
-        SHA1Final(digest, &ctx);
+        /* IKEY: key xored with 0x36. */
+        memcpy(kxor,seed,sizeof(kxor));
+        for (unsigned int i = 0; i < sizeof(kxor); i++) kxor[i] ^= 0x36;
+
+        /* Obtain HASH(IKEY||MESSAGE). */
+        SHA256_CTX ctx;
+        sha256_init(&ctx);
+        sha256_update(&ctx,kxor,sizeof(kxor));
+        sha256_update(&ctx,(unsigned char*)&counter,sizeof(counter));
+        sha256_final(&ctx,digest);
+
+        /* OKEY: key xored with 0x5c. */
+        memcpy(kxor,seed,sizeof(kxor));
+        for (unsigned int i = 0; i < sizeof(kxor); i++) kxor[i] ^= 0x5C;
+
+        /* Obtain HASH(OKEY || HASH(IKEY||MESSAGE)). */
+        sha256_init(&ctx);
+        sha256_update(&ctx,kxor,sizeof(kxor));
+        sha256_update(&ctx,digest,SHA256_BLOCK_SIZE);
+        sha256_final(&ctx,digest);
+
+        /* Increment the counter for the next iteration. */
         counter++;
 
         memcpy(p,digest,copylen);
@@ -727,9 +776,8 @@ sds getAbsolutePath(char *filename) {
  * Gets the proper timezone in a more portable fashion
  * i.e timezone variables are linux specific.
  */
-
-unsigned long getTimeZone(void) {
-#ifdef __linux__
+long getTimeZone(void) {
+#if defined(__linux__) || defined(__sun)
     return timezone;
 #else
     struct timeval tv;
@@ -737,7 +785,7 @@ unsigned long getTimeZone(void) {
 
     gettimeofday(&tv, &tz);
 
-    return tz.tz_minuteswest * 60UL;
+    return tz.tz_minuteswest * 60L;
 #endif
 }
 
@@ -898,9 +946,10 @@ static void test_ll2string(void) {
 }
 
 #define UNUSED(x) (void)(x)
-int utilTest(int argc, char **argv) {
+int utilTest(int argc, char **argv, int accurate) {
     UNUSED(argc);
     UNUSED(argv);
+    UNUSED(accurate);
 
     test_string2ll();
     test_string2l();

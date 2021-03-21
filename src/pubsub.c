@@ -124,20 +124,6 @@ void addReplyPubsubPatUnsubscribed(client *c, robj *pattern) {
  * Pubsub low level API
  *----------------------------------------------------------------------------*/
 
-void freePubsubPattern(void *p) {
-    pubsubPattern *pat = p;
-
-    decrRefCount(pat->pattern);
-    zfree(pat);
-}
-
-int listMatchPubsubPattern(void *a, void *b) {
-    pubsubPattern *pa = a, *pb = b;
-
-    return (pa->client == pb->client) &&
-           (equalStringObjects(pa->pattern,pb->pattern));
-}
-
 /* Return the number of channels + patterns a client is subscribed to. */
 int clientSubscriptionsCount(client *c) {
     return dictSize(c->pubsub_channels)+
@@ -206,17 +192,24 @@ int pubsubUnsubscribeChannel(client *c, robj *channel, int notify) {
 
 /* Subscribe a client to a pattern. Returns 1 if the operation succeeded, or 0 if the client was already subscribed to that pattern. */
 int pubsubSubscribePattern(client *c, robj *pattern) {
+    dictEntry *de;
+    list *clients;
     int retval = 0;
 
     if (listSearchKey(c->pubsub_patterns,pattern) == NULL) {
         retval = 1;
-        pubsubPattern *pat;
         listAddNodeTail(c->pubsub_patterns,pattern);
         incrRefCount(pattern);
-        pat = zmalloc(sizeof(*pat));
-        pat->pattern = getDecodedObject(pattern);
-        pat->client = c;
-        listAddNodeTail(server.pubsub_patterns,pat);
+        /* Add the client to the pattern -> list of clients hash table */
+        de = dictFind(server.pubsub_patterns,pattern);
+        if (de == NULL) {
+            clients = listCreate();
+            dictAdd(server.pubsub_patterns,pattern,clients);
+            incrRefCount(pattern);
+        } else {
+            clients = dictGetVal(de);
+        }
+        listAddNodeTail(clients,c);
     }
     /* Notify the client */
     addReplyPubsubPatSubscribed(c,pattern);
@@ -226,18 +219,27 @@ int pubsubSubscribePattern(client *c, robj *pattern) {
 /* Unsubscribe a client from a channel. Returns 1 if the operation succeeded, or
  * 0 if the client was not subscribed to the specified channel. */
 int pubsubUnsubscribePattern(client *c, robj *pattern, int notify) {
+    dictEntry *de;
+    list *clients;
     listNode *ln;
-    pubsubPattern pat;
     int retval = 0;
 
     incrRefCount(pattern); /* Protect the object. May be the same we remove */
     if ((ln = listSearchKey(c->pubsub_patterns,pattern)) != NULL) {
         retval = 1;
         listDelNode(c->pubsub_patterns,ln);
-        pat.client = c;
-        pat.pattern = pattern;
-        ln = listSearchKey(server.pubsub_patterns,&pat);
-        listDelNode(server.pubsub_patterns,ln);
+        /* Remove the client from the pattern -> clients list hash table */
+        de = dictFind(server.pubsub_patterns,pattern);
+        serverAssertWithInfo(c,NULL,de != NULL);
+        clients = dictGetVal(de);
+        ln = listSearchKey(clients,c);
+        serverAssertWithInfo(c,NULL,ln != NULL);
+        listDelNode(clients,ln);
+        if (listLength(clients) == 0) {
+            /* Free the list and associated hash entry at all if this was
+             * the latest client. */
+            dictDelete(server.pubsub_patterns,pattern);
+        }
     }
     /* Notify the client */
     if (notify) addReplyPubsubPatUnsubscribed(c,pattern);
@@ -248,18 +250,20 @@ int pubsubUnsubscribePattern(client *c, robj *pattern, int notify) {
 /* Unsubscribe from all the channels. Return the number of channels the
  * client was subscribed to. */
 int pubsubUnsubscribeAllChannels(client *c, int notify) {
-    dictIterator *di = dictGetSafeIterator(c->pubsub_channels);
-    dictEntry *de;
     int count = 0;
+    if (dictSize(c->pubsub_channels) > 0) {
+        dictIterator *di = dictGetSafeIterator(c->pubsub_channels);
+        dictEntry *de;
 
-    while((de = dictNext(di)) != NULL) {
-        robj *channel = dictGetKey(de);
+        while((de = dictNext(di)) != NULL) {
+            robj *channel = dictGetKey(de);
 
-        count += pubsubUnsubscribeChannel(c,channel,notify);
+            count += pubsubUnsubscribeChannel(c,channel,notify);
+        }
+        dictReleaseIterator(di);
     }
     /* We were subscribed to nothing? Still reply to the client. */
     if (notify && count == 0) addReplyPubsubUnsubscribed(c,NULL);
-    dictReleaseIterator(di);
     return count;
 }
 
@@ -284,6 +288,7 @@ int pubsubUnsubscribeAllPatterns(client *c, int notify) {
 int pubsubPublishMessage(robj *channel, robj *message) {
     int receivers = 0;
     dictEntry *de;
+    dictIterator *di;
     listNode *ln;
     listIter li;
 
@@ -302,39 +307,71 @@ int pubsubPublishMessage(robj *channel, robj *message) {
         }
     }
     /* Send to clients listening to matching channels */
-    if (listLength(server.pubsub_patterns)) {
-        listRewind(server.pubsub_patterns,&li);
+    di = dictGetIterator(server.pubsub_patterns);
+    if (di) {
         channel = getDecodedObject(channel);
-        while ((ln = listNext(&li)) != NULL) {
-            pubsubPattern *pat = ln->value;
-
-            if (stringmatchlen((char*)pat->pattern->ptr,
-                                sdslen(pat->pattern->ptr),
+        while((de = dictNext(di)) != NULL) {
+            robj *pattern = dictGetKey(de);
+            list *clients = dictGetVal(de);
+            if (!stringmatchlen((char*)pattern->ptr,
+                                sdslen(pattern->ptr),
                                 (char*)channel->ptr,
-                                sdslen(channel->ptr),0))
-            {
-                addReplyPubsubPatMessage(pat->client,
-                    pat->pattern,channel,message);
+                                sdslen(channel->ptr),0)) continue;
+
+            listRewind(clients,&li);
+            while ((ln = listNext(&li)) != NULL) {
+                client *c = listNodeValue(ln);
+                addReplyPubsubPatMessage(c,pattern,channel,message);
                 receivers++;
             }
         }
         decrRefCount(channel);
+        dictReleaseIterator(di);
     }
     return receivers;
+}
+
+/* This wraps handling ACL channel permissions for the given client. */
+int pubsubCheckACLPermissionsOrReply(client *c, int idx, int count, int literal) {
+    /* Check if the user can run the command according to the current
+     * ACLs. */
+    int acl_chanpos;
+    int acl_retval = ACLCheckPubsubPerm(c,idx,count,literal,&acl_chanpos);
+    if (acl_retval == ACL_DENIED_CHANNEL) {
+        addACLLogEntry(c,acl_retval,acl_chanpos,NULL);
+        addReplyError(c,
+            "-NOPERM this user has no permissions to access "
+            "one of the channels used as arguments");
+    }
+    return acl_retval;
 }
 
 /*-----------------------------------------------------------------------------
  * Pubsub commands implementation
  *----------------------------------------------------------------------------*/
 
+/* SUBSCRIBE channel [channel ...] */
 void subscribeCommand(client *c) {
     int j;
+    if (pubsubCheckACLPermissionsOrReply(c,1,c->argc-1,0) != ACL_OK) return;
+    if ((c->flags & CLIENT_DENY_BLOCKING) && !(c->flags & CLIENT_MULTI)) {
+        /**
+         * A client that has CLIENT_DENY_BLOCKING flag on
+         * expect a reply per command and so can not execute subscribe.
+         *
+         * Notice that we have a special treatment for multi because of
+         * backword compatibility
+         */
+        addReplyError(c, "SUBSCRIBE isn't allowed for a DENY BLOCKING client");
+        return;
+    }
 
     for (j = 1; j < c->argc; j++)
         pubsubSubscribeChannel(c,c->argv[j]);
     c->flags |= CLIENT_PUBSUB;
 }
 
+/* UNSUBSCRIBE [channel [channel ...]] */
 void unsubscribeCommand(client *c) {
     if (c->argc == 1) {
         pubsubUnsubscribeAllChannels(c,1);
@@ -347,14 +384,28 @@ void unsubscribeCommand(client *c) {
     if (clientSubscriptionsCount(c) == 0) c->flags &= ~CLIENT_PUBSUB;
 }
 
+/* PSUBSCRIBE pattern [pattern ...] */
 void psubscribeCommand(client *c) {
     int j;
+    if (pubsubCheckACLPermissionsOrReply(c,1,c->argc-1,1) != ACL_OK) return;
+    if ((c->flags & CLIENT_DENY_BLOCKING) && !(c->flags & CLIENT_MULTI)) {
+        /**
+         * A client that has CLIENT_DENY_BLOCKING flag on
+         * expect a reply per command and so can not execute subscribe.
+         *
+         * Notice that we have a special treatment for multi because of
+         * backword compatibility
+         */
+        addReplyError(c, "PSUBSCRIBE isn't allowed for a DENY BLOCKING client");
+        return;
+    }
 
     for (j = 1; j < c->argc; j++)
         pubsubSubscribePattern(c,c->argv[j]);
     c->flags |= CLIENT_PUBSUB;
 }
 
+/* PUNSUBSCRIBE [pattern [pattern ...]] */
 void punsubscribeCommand(client *c) {
     if (c->argc == 1) {
         pubsubUnsubscribeAllPatterns(c,1);
@@ -367,7 +418,9 @@ void punsubscribeCommand(client *c) {
     if (clientSubscriptionsCount(c) == 0) c->flags &= ~CLIENT_PUBSUB;
 }
 
+/* PUBLISH <channel> <message> */
 void publishCommand(client *c) {
+    if (pubsubCheckACLPermissionsOrReply(c,1,1,0) != ACL_OK) return;
     int receivers = pubsubPublishMessage(c->argv[1],c->argv[2]);
     if (server.cluster_enabled)
         clusterPropagatePublish(c->argv[1],c->argv[2]);
@@ -380,9 +433,13 @@ void publishCommand(client *c) {
 void pubsubCommand(client *c) {
     if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"help")) {
         const char *help[] = {
-"CHANNELS [<pattern>] -- Return the currently active channels matching a pattern (default: all).",
-"NUMPAT -- Return number of subscriptions to patterns.",
-"NUMSUB [channel-1 .. channel-N] -- Returns the number of subscribers for the specified channels (excluding patterns, default: none).",
+"CHANNELS [<pattern>]",
+"    Return the currently active channels matching a <pattern> (default: '*').",
+"NUMPAT",
+"    Return number of subscriptions to patterns.",
+"NUMSUB [<channel> ...]",
+"    Return the number of subscribers for the specified channels, excluding",
+"    pattern subscriptions(default: no channels).",
 NULL
         };
         addReplyHelp(c, help);
@@ -423,7 +480,7 @@ NULL
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"numpat") && c->argc == 2) {
         /* PUBSUB NUMPAT */
-        addReplyLongLong(c,listLength(server.pubsub_patterns));
+        addReplyLongLong(c,dictSize(server.pubsub_patterns));
     } else {
         addReplySubcommandSyntaxError(c);
     }
